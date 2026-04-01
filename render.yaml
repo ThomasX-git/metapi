@@ -1,8 +1,9 @@
 services:
   - type: web
     name: metapi
+    region: singapore
     runtime: docker
-    repo: https://github.com/cita-777/metapi
+    repo: https://github.com/ThomasX-git/metapi
     dockerfilePath: ./docker/Dockerfile
     dockerContext: .
     plan: free
@@ -20,7 +21,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: DB_TYPE
-        value: mysql
+        value: postgresql
       - key: DB_URL
         sync: false
       - key: DB_SSL
