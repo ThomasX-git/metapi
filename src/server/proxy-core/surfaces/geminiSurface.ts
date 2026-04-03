@@ -14,12 +14,12 @@ import { refreshOauthAccessTokenSingleflight } from '../../services/oauth/refres
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import * as routeRefreshWorkflow from '../../services/routeRefreshWorkflow.js';
 import { getDownstreamRoutingPolicy } from '../../routes/proxy/downstreamPolicy.js';
-import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
+import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
 import { composeProxyLogMessage } from '../../routes/proxy/logPathMeta.js';
 import {
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
-} from '../../routes/proxy/upstreamEndpoint.js';
+} from '../../services/upstreamEndpointRuntime.js';
 import {
   getUpstreamEndpointRuntimeStateSnapshot,
   recordUpstreamEndpointFailure,
@@ -35,12 +35,14 @@ import {
   unwrapGeminiCliPayload,
   wrapGeminiCliRequest,
 } from '../../routes/proxy/geminiCliCompat.js';
-import { dispatchRuntimeRequest } from '../../routes/proxy/runtimeExecutor.js';
+import { dispatchRuntimeRequest } from '../../services/runtimeDispatch.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../routes/proxy/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
+import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../firstByteTimeout.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
   buildSurfaceProxyDebugResponseHeaders,
   captureSurfaceProxyDebugSuccessResponseBody,
@@ -252,6 +254,8 @@ async function logProxy(
   promptTokens = 0,
   completionTokens = 0,
   totalTokens = 0,
+  isStream = false,
+  firstByteLatencyMs: number | null = null,
 ) {
   try {
     const createdAt = formatUtcSqlDateTime(new Date());
@@ -273,6 +277,8 @@ async function logProxy(
       modelActual: selected.actualModel || modelRequested,
       status,
       httpStatus,
+      isStream,
+      firstByteLatencyMs,
       latencyMs,
       promptTokens,
       completionTokens,
@@ -610,6 +616,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
       const isInternalGemini = isInternalGeminiPlatform(selected.site.platform);
       const isDirectGeminiFamily = isDirectGeminiFamilyPlatform(selected.site.platform);
       const startTime = Date.now();
+      const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
       let upstreamPath = '';
 
       try {
@@ -697,11 +704,12 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               requestHeaders,
               targetUrl,
               runtimeExecutor,
-              dispatch: () => (
+              dispatch: (signal?: AbortSignal) => (
                 isInternalGemini
                   ? dispatchRuntimeRequest({
                     siteUrl: selected.site.url,
                     targetUrl,
+                    signal,
                     request: {
                       endpoint: 'chat',
                       path: upstreamPath,
@@ -727,13 +735,22 @@ export async function geminiProxyRoute(app: FastifyInstance) {
                     method: 'POST',
                     headers: requestHeaders,
                     body: JSON.stringify(requestBody),
+                    signal,
                   })
               ),
             };
           };
 
           let directDispatchState = buildDirectDispatchState();
-          let upstream = await directDispatchState.dispatch();
+          const dispatchWithObservedFirstByte = async () => fetchWithObservedFirstByte(
+            (signal) => directDispatchState.dispatch(signal),
+            {
+              firstByteTimeoutMs,
+              startedAtMs: Date.now(),
+            },
+          );
+          let upstream = await dispatchWithObservedFirstByte();
+          let firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
           let contentType = upstream.headers.get('content-type') || 'application/json';
           let recoverApplied = false;
           if (upstream.status === 401 && oauth) {
@@ -747,7 +764,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               };
               oauth = getOauthInfoFromAccount(selected.account);
               directDispatchState = buildDirectDispatchState();
-              upstream = await directDispatchState.dispatch();
+              upstream = await dispatchWithObservedFirstByte();
+              firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
               contentType = upstream.headers.get('content-type') || 'application/json';
               recoverApplied = true;
             } catch {
@@ -790,6 +808,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               downstreamPath,
               upstreamPath,
               clientContext,
+              0,
+              0,
+              0,
+              isStreamAction,
+              firstByteLatencyMs,
             );
             if (canRetryChannelSelection(retryCount, forcedChannelId)) {
               retryCount += 1;
@@ -828,6 +851,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
                 downstreamPath,
                 upstreamPath,
                 clientContext,
+                0,
+                0,
+                0,
+                isStreamAction,
+                firstByteLatencyMs,
               );
               await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
                 attemptIndex: retryCount,
@@ -912,6 +940,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
                 parsedUsage.promptTokens,
                 parsedUsage.completionTokens,
                 parsedUsage.totalTokens,
+                isStreamAction,
+                firstByteLatencyMs,
               );
               await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
                 attemptIndex: retryCount,
@@ -964,6 +994,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
                 parsedUsage.promptTokens,
                 parsedUsage.completionTokens,
                 parsedUsage.totalTokens,
+                isStreamAction,
+                firstByteLatencyMs,
               );
               await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
                 attemptIndex: retryCount,
@@ -1028,6 +1060,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               parsedUsage.promptTokens,
               parsedUsage.completionTokens,
               parsedUsage.totalTokens,
+              isStreamAction,
+              firstByteLatencyMs,
             );
             await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
               attemptIndex: retryCount,
@@ -1073,6 +1107,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               downstreamPath,
               upstreamPath,
               clientContext,
+              0,
+              0,
+              0,
+              isStreamAction,
+              firstByteLatencyMs,
             );
             await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
               attemptIndex: retryCount,
@@ -1191,10 +1230,15 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           };
         };
         const channelProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
-        const dispatchRequest = (compatibilityRequest: BuiltEndpointRequest, targetUrl?: string) => (
+        const dispatchRequest = (
+          compatibilityRequest: BuiltEndpointRequest,
+          targetUrl?: string,
+          signal?: AbortSignal,
+        ) => (
           dispatchRuntimeRequest({
             siteUrl: selected.site.url,
             targetUrl,
+            signal,
             request: compatibilityRequest,
             buildInit: async (_requestUrl, requestForFetch) => withSiteRecordProxyRequestInit(selected.site, {
               method: 'POST',
@@ -1220,10 +1264,15 @@ export async function geminiProxyRoute(app: FastifyInstance) {
         const endpointResult = await executeEndpointFlow({
           siteUrl: selected.site.url,
           disableCrossProtocolFallback: config.disableCrossProtocolFallback,
+          firstByteTimeoutMs,
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,
           tryRecover: endpointStrategy.tryRecover,
+          shouldAbortRemainingEndpoints: (ctx) => shouldAbortSameSiteEndpointFallback(
+            ctx.response.status,
+            ctx.rawErrText || ctx.errText,
+          ),
           onAttemptFailure: async (ctx) => {
             const memoryWrite = recordUpstreamEndpointFailure({
               ...endpointRuntimeContext,
@@ -1306,6 +1355,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             downstreamPath,
             null,
             clientContext,
+            0,
+            0,
+            0,
+            isStreamAction,
+            null,
           );
           if (canRetryChannelSelection(retryCount, forcedChannelId)) {
             retryCount += 1;
@@ -1319,6 +1373,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
 
         upstreamPath = endpointResult.upstreamPath;
         const upstream = endpointResult.upstream;
+        const firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
         const rawText = await readRuntimeResponseText(upstream);
         let upstreamData: unknown = rawText;
         try {
@@ -1350,6 +1405,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           parsedUsage.promptTokens,
           parsedUsage.completionTokens,
           parsedUsage.totalTokens,
+          isStreamAction,
+          firstByteLatencyMs,
         );
         const downstreamPayload = isGeminiCliDownstream
           ? { response: geminiResponse }
@@ -1392,6 +1449,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           downstreamPath,
           upstreamPath || null,
           clientContext,
+          0,
+          0,
+          0,
+          isStreamAction,
+          null,
         );
         if (canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount += 1;

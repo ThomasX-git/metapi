@@ -21,9 +21,13 @@ const dbInsertMock = vi.fn((_arg?: any) => ({
   }),
 }));
 
-vi.mock('undici', () => ({
-  fetch: (...args: unknown[]) => fetchMock(...args),
-}));
+vi.mock('undici', async () => {
+  const actual = await vi.importActual<typeof import('undici')>('undici');
+  return {
+    ...actual,
+    fetch: (...args: unknown[]) => fetchMock(...args),
+  };
+});
 
 vi.mock('../../services/tokenRouter.js', () => ({
   tokenRouter: {
@@ -55,6 +59,7 @@ vi.mock('../../services/modelPricingService.js', () => ({
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
   shouldRetryProxyRequest: () => false,
+  shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
 }));
 
@@ -89,6 +94,7 @@ vi.mock('../../db/index.js', () => ({
   hasProxyLogBillingDetailsColumn: async () => false,
   hasProxyLogClientColumns: async () => false,
   hasProxyLogDownstreamApiKeyIdColumn: async () => false,
+  hasProxyLogStreamTimingColumns: async () => false,
   schema: {
     proxyLogs: {},
     siteApiEndpoints: {
@@ -204,7 +210,8 @@ describe('chat proxy codex oauth compatibility', () => {
     expect(forwardedBody.store).toBe(false);
     expect(forwardedBody.parallel_tool_calls).toBeUndefined();
     expect(forwardedBody.include).toBeUndefined();
-    expect(forwardedBody.max_output_tokens).toBe(256);
+    expect(forwardedBody.max_output_tokens).toBeUndefined();
+    expect(forwardedBody.max_tokens).toBeUndefined();
     expect(forwardedBody.max_completion_tokens).toBeUndefined();
 
     const body = response.json();

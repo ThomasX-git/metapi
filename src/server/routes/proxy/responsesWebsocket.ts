@@ -4,12 +4,14 @@ import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
+import { buildCodexSessionResponseStoreKey } from '../../proxy-core/runtime/codexSessionResponseStore.js';
 import {
   authorizeDownstreamToken,
   consumeManagedKeyRequest,
   isModelAllowedByPolicyOrAllowedRoutes,
   type DownstreamTokenAuthSuccess,
 } from '../../services/downstreamApiKeyService.js';
+import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { buildOauthProviderHeaders } from '../../services/oauth/service.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
@@ -127,6 +129,18 @@ function selectedChannelSupportsIncrementalInput(
   requestModel: string,
 ): boolean {
   return selectedChannelSupportsCodexWebsocketTransport(selectedChannel, requestModel);
+}
+
+function unwrapCodexWebsocketRuntimeError(error: unknown): CodexWebsocketRuntimeError {
+  if (error instanceof CodexWebsocketRuntimeError) return error;
+  if (error instanceof SiteApiEndpointRequestError && error.cause instanceof CodexWebsocketRuntimeError) {
+    return error.cause;
+  }
+  return new CodexWebsocketRuntimeError(
+    error instanceof Error && error.message.trim()
+      ? error.message
+      : 'upstream websocket request failed',
+  );
 }
 
 function shouldReuseSelectedChannel(
@@ -541,13 +555,23 @@ async function handleResponsesWebsocketConnection(
   const websocketSessionId = headerValueToTrimmedString(request.headers['session_id'])
     || headerValueToTrimmedString(request.headers['session-id'])
     || randomUUID();
+  const runtimeSessionKeys = new Set<string>();
   let lastRequest: Record<string, unknown> | null = null;
   let lastResponseOutput: unknown[] = [];
   let selectedChannel: SelectedChannel | null = null;
   let messageQueue = Promise.resolve();
 
   socket.once('close', () => {
-    void codexWebsocketRuntime.closeSession(websocketSessionId);
+    const sessionKeys = runtimeSessionKeys.size > 0
+      ? Array.from(runtimeSessionKeys)
+      : [websocketSessionId];
+    void Promise.all(sessionKeys.map(async (sessionKey) => {
+      try {
+        await codexWebsocketRuntime.closeSession(sessionKey);
+      } catch {
+        // Ignore close-time cleanup failures after downstream disconnects.
+      }
+    }));
   });
 
   socket.on('message', (raw) => {
@@ -617,37 +641,59 @@ async function handleResponsesWebsocketConnection(
               account: codexWebsocketChannel.account,
               downstreamHeaders,
             });
-            const prepared = buildUpstreamEndpointRequest({
-              endpoint: 'responses',
-              modelName: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
-              stream: true,
-              tokenValue: codexWebsocketChannel.tokenValue,
-              sitePlatform: codexWebsocketChannel.site.platform,
-              siteUrl: codexWebsocketChannel.site.url,
-              openaiBody: normalized.request,
-              downstreamFormat: 'responses',
-              responsesOriginalBody: normalized.request,
-              downstreamHeaders,
-              providerHeaders,
-              codexExplicitSessionId: deriveCodexExplicitSessionId(normalized.request, websocketSessionId),
-            });
-            const requestUrl = `${codexWebsocketChannel.site.url.replace(/\/+$/, '')}${prepared.path}`;
+
+            const websocketRuntimeSessionKey = buildCodexSessionResponseStoreKey({
+              sessionId: websocketSessionId,
+              siteId: codexWebsocketChannel.site.id,
+              accountId: codexWebsocketChannel.account.id,
+              channelId: codexWebsocketChannel.channel.id,
+            }) || websocketSessionId;
+            runtimeSessionKeys.add(websocketRuntimeSessionKey);
 
             try {
-              const runtimeResult = await codexWebsocketRuntime.sendRequest({
-                sessionId: websocketSessionId,
-                requestUrl,
-                headers: prepared.headers,
-                body: prepared.body,
-              });
+              const runtimeResult = await runWithSiteApiEndpointPool(
+                codexWebsocketChannel.site as Parameters<typeof runWithSiteApiEndpointPool>[0],
+                async (target) => {
+                  const prepared = buildUpstreamEndpointRequest({
+                    endpoint: 'responses',
+                    modelName: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
+                    stream: true,
+                    tokenValue: codexWebsocketChannel.tokenValue,
+                    sitePlatform: codexWebsocketChannel.site.platform,
+                    siteUrl: target.baseUrl,
+                    openaiBody: normalized.request,
+                    downstreamFormat: 'responses',
+                    responsesOriginalBody: normalized.request,
+                    downstreamHeaders,
+                    providerHeaders,
+                    codexExplicitSessionId: deriveCodexExplicitSessionId(normalized.request, websocketSessionId),
+                  });
+                  const requestUrl = `${target.baseUrl.replace(/\/+$/, '')}${prepared.path}`;
+
+                  try {
+                    return await codexWebsocketRuntime.sendRequest({
+                      sessionId: websocketRuntimeSessionKey,
+                      requestUrl,
+                      headers: prepared.headers,
+                      body: prepared.body,
+                    });
+                  } catch (error) {
+                    const runtimeError = error instanceof CodexWebsocketRuntimeError
+                      ? error
+                      : new CodexWebsocketRuntimeError('upstream websocket request failed');
+                    throw new SiteApiEndpointRequestError(runtimeError.message, {
+                      status: runtimeError.status,
+                      cause: runtimeError,
+                    });
+                  }
+                },
+              );
               lastResponseOutput = collectResponsesOutput(runtimeResult.events);
               for (const payload of runtimeResult.events) {
                 socket.send(JSON.stringify(payload));
               }
             } catch (error) {
-              const runtimeError = error instanceof CodexWebsocketRuntimeError
-                ? error
-                : new CodexWebsocketRuntimeError('upstream websocket request failed');
+              const runtimeError = unwrapCodexWebsocketRuntimeError(error);
               if (runtimeError.status && runtimeError.events.length === 0) {
                 const forwarded = await forwardResponsesRequestViaHttp({
                   app,

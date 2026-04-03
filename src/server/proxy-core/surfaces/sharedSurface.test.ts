@@ -85,6 +85,7 @@ vi.mock('../../services/alertRules.js', () => ({
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
   shouldRetryProxyRequest: (...args: unknown[]) => shouldRetryProxyRequestMock(...args),
+  shouldAbortSameSiteEndpointFallback: () => false,
 }));
 
 vi.mock('../../services/oauth/quota.js', () => ({
@@ -383,6 +384,8 @@ describe('selectSurfaceChannelForAttempt', () => {
       modelActual: 'upstream-model',
       status: 'failed',
       httpStatus: 502,
+      isStream: null,
+      firstByteLatencyMs: null,
       latencyMs: 1200,
       promptTokens: 10,
       completionTokens: 5,
@@ -994,6 +997,8 @@ describe('selectSurfaceChannelForAttempt', () => {
       modelRequested: 'gpt-5.2',
       status: 'success',
       httpStatus: 200,
+      isStream: null,
+      firstByteLatencyMs: null,
       latencyMs: 250,
       errorMessage: null,
       retryCount: 1,

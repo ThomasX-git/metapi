@@ -9,7 +9,7 @@ import {
   buildClaudeCountTokensUpstreamRequest,
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
-} from '../../routes/proxy/upstreamEndpoint.js';
+} from '../../services/upstreamEndpointRuntime.js';
 import {
   getUpstreamEndpointRuntimeStateSnapshot,
   recordUpstreamEndpointFailure,
@@ -20,10 +20,11 @@ import {
   getDownstreamRoutingPolicy,
   recordDownstreamCostUsage,
 } from '../../routes/proxy/downstreamPolicy.js';
-import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
+import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
 import { detectProxyFailure } from '../../routes/proxy/proxyFailureJudge.js';
 import { openAiChatTransformer } from '../../transformers/openai/chat/index.js';
 import { anthropicMessagesTransformer } from '../../transformers/anthropic/messages/index.js';
+import { shouldPreferResponsesForAnthropicContinuation } from '../../transformers/anthropic/messages/compatibility.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import {
   ProxyInputFileResolutionError,
@@ -44,9 +45,11 @@ import {
   unwrapGeminiCliPayload,
 } from '../../routes/proxy/geminiCliCompat.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
+import { getObservedResponseMeta } from '../firstByteTimeout.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { detectDownstreamClientContext } from '../../routes/proxy/downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -170,6 +173,10 @@ export async function handleChatSurfaceRequest(
   }
   const conversationFileSummary = summarizeConversationFileInputsInOpenAiBody(resolvedOpenAiBody);
   const hasNonImageFileInput = conversationFileSummary.hasDocument;
+  const wantsContinuationAwareResponses = (
+    downstreamFormat === 'claude'
+    && shouldPreferResponsesForAnthropicContinuation(claudeOriginalBody)
+  );
   const codexSessionCacheKey = deriveCodexSessionCacheKey({
     downstreamFormat,
     body: downstreamFormat === 'claude' ? claudeOriginalBody : request.body,
@@ -283,6 +290,7 @@ export async function handleChatSurfaceRequest(
         {
           hasNonImageFileInput,
           conversationFileSummary,
+          wantsContinuationAwareResponses,
         },
       ),
     ];
@@ -297,6 +305,7 @@ export async function handleChatSurfaceRequest(
       requestCapabilities: {
         hasNonImageFileInput,
         conversationFileSummary,
+        wantsContinuationAwareResponses,
       },
     };
     await safeUpdateSurfaceProxyDebugCandidates(debugTrace, {
@@ -309,6 +318,7 @@ export async function handleChatSurfaceRequest(
         stickyPreferredChannelId,
         oauthProvider: oauth?.provider || null,
         isCodexSite,
+        wantsContinuationAwareResponses,
       },
     });
     const buildProviderHeaders = () => (
@@ -385,10 +395,15 @@ export async function handleChatSurfaceRequest(
       return executeEndpointFlow({
         siteUrl: siteApiBaseUrl,
         disableCrossProtocolFallback: config.disableCrossProtocolFallback,
+        firstByteTimeoutMs: Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000)),
         endpointCandidates,
         buildRequest: (endpoint) => buildEndpointRequest(endpoint),
         dispatchRequest,
         tryRecover,
+        shouldAbortRemainingEndpoints: (ctx) => shouldAbortSameSiteEndpointFallback(
+          ctx.response.status,
+          ctx.rawErrText || ctx.errText,
+        ),
         onAttemptFailure: async (ctx) => {
           const memoryWrite = recordUpstreamEndpointFailure({
             ...endpointRuntimeContext,
@@ -512,6 +527,7 @@ export async function handleChatSurfaceRequest(
 
       const upstream = endpointResult.upstream;
       const successfulUpstreamPath = endpointResult.upstreamPath;
+      const firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
 
       if (isStream) {
         const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
@@ -544,6 +560,8 @@ export async function handleChatSurfaceRequest(
             parsedUsage,
             upstreamUsagePresent,
             requestStartedAtMs: startTime,
+            isStream: true,
+            firstByteLatencyMs,
             latencyMs,
             retryCount,
             upstreamPath: successfulUpstreamPath,
@@ -905,6 +923,8 @@ export async function handleChatSurfaceRequest(
         parsedUsage,
         upstreamUsagePresent,
         requestStartedAtMs: startTime,
+        isStream: false,
+        firstByteLatencyMs,
         latencyMs: latency,
         retryCount,
         upstreamPath: successfulUpstreamPath,
@@ -948,6 +968,7 @@ export async function handleChatSurfaceRequest(
           status: endpointFailureStatus || 502,
           errText: err.message || 'unknown error',
           rawErrText: err.rawErrText || err.message || 'unknown error',
+          isStream,
           latencyMs: Date.now() - startTime,
           retryCount,
         });
@@ -972,6 +993,7 @@ export async function handleChatSurfaceRequest(
         requestedModel,
         modelName,
         errorMessage: err?.message || 'network failure',
+        isStream,
         latencyMs: Date.now() - startTime,
         retryCount,
       });
@@ -1374,6 +1396,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
           status: endpointFailureStatus || 502,
           errText: error.message || 'unknown error',
           rawErrText: error.rawErrText || error.message || 'unknown error',
+          isStream: false,
           latencyMs: Date.now() - startTime,
           retryCount,
         });
@@ -1394,6 +1417,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
         requestedModel,
         modelName,
         errorMessage: error?.message || 'network failure',
+        isStream: false,
         latencyMs: Date.now() - startTime,
         retryCount,
       });

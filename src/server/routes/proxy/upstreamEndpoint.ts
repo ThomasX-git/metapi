@@ -3,6 +3,7 @@ import {
   rankConversationFileEndpoints,
   type ConversationFileInputSummary,
 } from '../../proxy-core/capabilities/conversationFileCapabilities.js';
+import type { UpstreamEndpoint } from '../../proxy-core/orchestration/upstreamRequest.js';
 import { resolveProviderProfile } from '../../proxy-core/providers/registry.js';
 import { config } from '../../config.js';
 import { fetchModelPricingCatalog } from '../../services/modelPricingService.js';
@@ -16,6 +17,7 @@ import {
   convertOpenAiBodyToResponsesBody as convertOpenAiBodyToResponsesBodyViaTransformer,
   sanitizeResponsesBodyForProxy as sanitizeResponsesBodyForProxyViaTransformer,
 } from '../../transformers/openai/responses/conversion.js';
+import { normalizeCodexResponsesBodyForProxy } from '../../transformers/openai/responses/codexCompatibility.js';
 import {
   convertOpenAiBodyToAnthropicMessagesBody,
   sanitizeAnthropicMessagesBody,
@@ -46,7 +48,7 @@ export {
   shouldPreferResponsesAfterLegacyChatError,
 };
 
-export type UpstreamEndpoint = 'chat' | 'messages' | 'responses';
+export type { UpstreamEndpoint } from '../../proxy-core/orchestration/upstreamRequest.js';
 export type EndpointPreference = DownstreamFormat | 'responses';
 
 type ChannelContext = {
@@ -225,6 +227,15 @@ function extractClaudeBetasFromBody(body: Record<string, unknown>): {
   };
 }
 
+function stripClaudeMessagesContinuationFields(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...body };
+  delete next.previous_response_id;
+  delete next.prompt_cache_key;
+  return next;
+}
+
 function buildAntigravityRuntimeHeaders(input: {
   baseHeaders: Record<string, string>;
   stream: boolean;
@@ -360,61 +371,6 @@ function toFiniteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function ensureCodexResponsesInstructions(
-  body: Record<string, unknown>,
-  sitePlatform: string,
-): Record<string, unknown> {
-  if (sitePlatform !== 'codex') return body;
-  if (typeof body.instructions === 'string') return body;
-  return {
-    ...body,
-    instructions: '',
-  };
-}
-
-function ensureCodexResponsesStoreFalse(
-  body: Record<string, unknown>,
-  sitePlatform: string,
-): Record<string, unknown> {
-  if (sitePlatform !== 'codex') return body;
-  return {
-    ...body,
-    store: false,
-  };
-}
-
-function convertCodexSystemRoleToDeveloper(input: unknown): unknown {
-  if (!Array.isArray(input)) return input;
-  return input.map((item) => {
-    if (!isRecord(item)) return item;
-    if (asTrimmedString(item.type).toLowerCase() !== 'message') return item;
-    if (asTrimmedString(item.role).toLowerCase() !== 'system') return item;
-    return {
-      ...item,
-      role: 'developer',
-    };
-  });
-}
-
-function applyCodexResponsesCompatibility(
-  body: Record<string, unknown>,
-  sitePlatform: string,
-): Record<string, unknown> {
-  if (sitePlatform !== 'codex') return body;
-
-  const next: Record<string, unknown> = {
-    ...body,
-    input: convertCodexSystemRoleToDeveloper(body.input),
-  };
-
-  if (typeof next.instructions !== 'string') {
-    next.instructions = '';
-  }
-
-  return next;
-}
-
-
 function normalizeEndpointTypes(value: unknown): UpstreamEndpoint[] {
   const raw = asTrimmedString(value).toLowerCase();
   if (!raw) return [];
@@ -529,6 +485,7 @@ export async function resolveUpstreamEndpointCandidates(
     hasNonImageFileInput?: boolean;
     conversationFileSummary?: ConversationFileInputSummary;
     wantsNativeResponsesReasoning?: boolean;
+    wantsContinuationAwareResponses?: boolean;
   },
 ): Promise<UpstreamEndpoint[]> {
   const sitePlatform = normalizePlatformName(context.site.platform);
@@ -540,6 +497,7 @@ export async function resolveUpstreamEndpointCandidates(
   const preferMessagesForClaudeModel = capabilityProfile.preferMessagesForClaudeModel;
   const hasNonImageFileInput = capabilityProfile.hasNonImageFileInput;
   const wantsNativeResponsesReasoning = capabilityProfile.wantsNativeResponsesReasoning;
+  const wantsContinuationAwareResponses = capabilityProfile.wantsContinuationAwareResponses;
   const applyRuntimePreference = (candidates: UpstreamEndpoint[]) => (
     applyUpstreamEndpointRuntimePreference(candidates, {
       siteId: context.site.id,
@@ -587,9 +545,11 @@ export async function resolveUpstreamEndpointCandidates(
     })()
     : preferred;
   const prioritizedPreferredEndpoints: UpstreamEndpoint[] = (
-    wantsNativeResponsesReasoning
-    && preferMessagesForClaudeModel
-    && preferredWithCapabilities.includes('responses')
+    preferredWithCapabilities.includes('responses')
+    && (
+      wantsContinuationAwareResponses
+      || (wantsNativeResponsesReasoning && preferMessagesForClaudeModel)
+    )
   )
     ? [
       'responses',
@@ -865,7 +825,7 @@ export function buildUpstreamEndpointRequest(input: {
       && input.forceNormalizeClaudeBody !== true
     )
       ? {
-        ...input.claudeOriginalBody,
+        ...stripClaudeMessagesContinuationFields(input.claudeOriginalBody),
         model: input.modelName,
         stream: input.stream,
       }
@@ -876,7 +836,7 @@ export function buildUpstreamEndpointRequest(input: {
       && input.forceNormalizeClaudeBody === true
     )
       ? sanitizeAnthropicMessagesBody({
-        ...input.claudeOriginalBody,
+        ...stripClaudeMessagesContinuationFields(input.claudeOriginalBody),
         model: input.modelName,
         stream: input.stream,
       })
@@ -943,17 +903,11 @@ export function buildUpstreamEndpointRequest(input: {
     if (preserveWebsocketIncrementalMode && rawBody.generate === false) {
       sanitizedResponsesBody.generate = false;
     }
-    const body = ensureCodexResponsesStoreFalse(
-      ensureCodexResponsesInstructions(
-        applyCodexResponsesCompatibility(
-          sanitizedResponsesBody,
-          sitePlatform,
-        ),
-        sitePlatform,
-      ),
+    const body = normalizeCodexResponsesBodyForProxy(
+      sanitizedResponsesBody,
       sitePlatform,
     );
-    const configuredResponsesBody = ensureCodexResponsesStoreFalse(
+    const configuredResponsesBody = normalizeCodexResponsesBodyForProxy(
       applyConfiguredPayloadRules(body),
       sitePlatform,
     );
@@ -1034,7 +988,7 @@ export function buildClaudeCountTokensUpstreamRequest(input: {
   const sitePlatform = normalizePlatformName(input.sitePlatform);
   const claudeHeaders = extractClaudePassthroughHeaders(input.downstreamHeaders);
   const { body: bodyWithoutBetas, betas } = extractClaudeBetasFromBody({
-    ...input.claudeBody,
+    ...stripClaudeMessagesContinuationFields(input.claudeBody),
     model: input.modelName,
   });
   const sanitizedBody = sanitizeAnthropicMessagesBody(bodyWithoutBetas);
