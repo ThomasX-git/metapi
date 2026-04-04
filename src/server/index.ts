@@ -24,6 +24,7 @@ import { oauthRoutes } from './routes/api/oauth.js';
 import { siteAnnouncementsRoutes } from './routes/api/siteAnnouncements.js';
 import { updateCenterRoutes } from './routes/api/updateCenter.js';
 import { proxyRoutes } from './routes/proxy/router.js';
+import { hiddenServerIpPageRoutes } from './routes/hidden/serverIpPage.js';
 import { startScheduler } from './services/checkinScheduler.js';
 import * as routeRefreshWorkflow from './services/routeRefreshWorkflow.js';
 import { startProxyFileRetentionService, stopProxyFileRetentionService } from './services/proxyFileRetentionService.js';
@@ -200,6 +201,7 @@ app.addHook('onRequest', async (request, reply) => {
 
 // Register API routes
 await app.register(registerDesktopRoutes);
+await app.register(hiddenServerIpPageRoutes);
 await app.register(sitesRoutes);
 await app.register(accountsRoutes);
 await app.register(checkinRoutes);

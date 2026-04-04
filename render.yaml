@@ -30,3 +30,5 @@ services:
         value: "0 8 * * *"
       - key: BALANCE_REFRESH_CRON
         value: "0 * * * *"
+      - key: IFCONFIG_TOKEN
+        sync: false

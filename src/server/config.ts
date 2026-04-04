@@ -34,6 +34,15 @@ function parseOptionalSecret(value: string | undefined): string {
   return (value || '').trim();
 }
 
+export function normalizeIfconfigToken(value: string | undefined): string {
+  const normalized = (value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized;
+}
+
 function parseJsonValue(value: string | undefined): unknown {
   if (!value) return undefined;
   try {
@@ -75,6 +84,7 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     claudeClientSecret: parseOptionalSecret(env.CLAUDE_CLIENT_SECRET),
     geminiCliClientId: parseOptionalSecret(env.GEMINI_CLI_CLIENT_ID) || DEFAULT_GEMINI_CLI_CLIENT_ID,
     geminiCliClientSecret: parseOptionalSecret(env.GEMINI_CLI_CLIENT_SECRET) || DEFAULT_GEMINI_CLI_CLIENT_SECRET,
+    ifconfigToken: normalizeIfconfigToken(env.IFCONFIG_TOKEN),
     systemProxyUrl: env.SYSTEM_PROXY_URL || '',
     accountCredentialSecret: env.ACCOUNT_CREDENTIAL_SECRET || env.AUTH_TOKEN || 'change-me-admin-token',
     checkinCron: env.CHECKIN_CRON || '0 8 * * *',
