@@ -25,6 +25,7 @@ import { siteAnnouncementsRoutes } from './routes/api/siteAnnouncements.js';
 import { updateCenterRoutes } from './routes/api/updateCenter.js';
 import { proxyRoutes } from './routes/proxy/router.js';
 import { hiddenServerIpPageRoutes } from './routes/hidden/serverIpPage.js';
+import { isHiddenServerIpRouteNamespace } from './services/serverIpPage.js';
 import { startScheduler } from './services/checkinScheduler.js';
 import * as routeRefreshWorkflow from './services/routeRefreshWorkflow.js';
 import { startProxyFileRetentionService, stopProxyFileRetentionService } from './services/proxyFileRetentionService.js';
@@ -243,7 +244,11 @@ if (existsSync(webDir)) {
   });
   // SPA fallback
   app.setNotFoundHandler(async (request, reply) => {
-    if (!request.url.startsWith('/api/') && !request.url.startsWith('/v1/')) {
+    if (
+      !request.url.startsWith('/api/')
+      && !request.url.startsWith('/v1/')
+      && !isHiddenServerIpRouteNamespace(request.url)
+    ) {
       return reply.sendFile('index.html');
     }
     reply.code(404).send({ error: 'Not found' });

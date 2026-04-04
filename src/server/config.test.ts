@@ -66,6 +66,14 @@ describe('buildConfig', () => {
     expect(config.codexResponsesWebsocketBeta).toBe('responses_websockets=2099-01-01');
   });
 
+  it('preserves IFCONFIG_TOKEN characters instead of rewriting the secret', () => {
+    const config = buildConfig({
+      IFCONFIG_TOKEN: 'AbC/+==_-.Token',
+    });
+
+    expect(config.ifconfigToken).toBe('AbC/+==_-.Token');
+  });
+
   it('accepts JSON request bodies larger than Fastify default 1 MiB', async () => {
     const app = Fastify(buildFastifyOptions(buildConfig({})));
     const largeText = 'a'.repeat(2 * 1024 * 1024);

@@ -5,6 +5,7 @@ import { withExplicitProxyRequestInit } from './siteProxy.js';
 const SERVER_IP_PROBE_URL = 'https://ifconfig.me/all.json';
 const SERVER_IP_PROBE_TIMEOUT_MS = 5_000;
 const HIDDEN_SERVER_IP_PAGE_PREFIX = '/.metapi-shadow/net-ip-';
+const HIDDEN_SERVER_IP_ROUTE_NAMESPACE = '/.metapi-shadow/';
 
 type ServerIpProbePayload = Record<string, unknown>;
 
@@ -13,9 +14,21 @@ export type HiddenServerIpPageResponse = {
   html: string;
 };
 
+export function isHiddenServerIpRouteNamespace(path: string): boolean {
+  return path.startsWith(HIDDEN_SERVER_IP_ROUTE_NAMESPACE);
+}
+
 export function getHiddenServerIpPagePath(): string | null {
   if (!config.ifconfigToken) return null;
-  return `${HIDDEN_SERVER_IP_PAGE_PREFIX}${config.ifconfigToken}`;
+  return `${HIDDEN_SERVER_IP_PAGE_PREFIX}${encodeURIComponent(config.ifconfigToken)}`;
+}
+
+export function getHiddenServerIpPageRoutePattern(): string {
+  return `${HIDDEN_SERVER_IP_PAGE_PREFIX}*`;
+}
+
+export function matchesHiddenServerIpRouteToken(token: string): boolean {
+  return !!config.ifconfigToken && token === config.ifconfigToken;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
