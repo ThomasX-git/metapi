@@ -1,29 +1,22 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useToast } from '../components/Toast.js';
 import { useIsMobile } from '../components/useIsMobile.js';
 import ChangeKeyModal from '../components/ChangeKeyModal.js';
 import { useAnimatedVisibility } from '../components/useAnimatedVisibility.js';
 import ModernSelect from '../components/ModernSelect.js';
-import DownstreamApiKeyModal from './settings/DownstreamApiKeyModal.js';
+import ResponsiveFormGrid from '../components/ResponsiveFormGrid.js';
 import FactoryResetModal from './settings/FactoryResetModal.js';
 import ModelAvailabilityProbeConfirmModal from './settings/ModelAvailabilityProbeConfirmModal.js';
-import RouteSelectorModal from './settings/RouteSelectorModal.js';
 import UpdateCenterSection from './settings/UpdateCenterSection.js';
 import {
   applyRoutingProfilePreset,
   resolveRoutingProfilePreset,
   type RoutingWeights,
 } from './helpers/routingProfiles.js';
-import { fuzzyMatch } from './helpers/fuzzySearch.js';
 import { clearAuthSession } from '../authSession.js';
 import { clearAppInstallationState } from '../appLocalState.js';
 import { tr } from '../i18n.js';
-import {
-  isExactModelPattern,
-  resolveRouteTitle,
-} from './token-routes/utils.js';
 import { generateDownstreamSkKey } from './helpers/generateDownstreamSkKey.js';
 
 const PROXY_TOKEN_PREFIX = 'sk-';
@@ -50,6 +43,7 @@ const CHECKIN_INTERVAL_OPTIONS = Array.from({ length: 24 }, (_, index) => {
 });
 type DbDialect = 'sqlite' | 'mysql' | 'postgres';
 type RouteCooldownUnit = typeof ROUTE_COOLDOWN_UNIT_OPTIONS[number]['value'];
+type SettingsPillTone = 'neutral' | 'primary' | 'danger' | 'warning';
 
 type RuntimeSettings = {
   checkinCron: string;
@@ -62,6 +56,7 @@ type RuntimeSettings = {
   logCleanupRetentionDays: number;
   modelAvailabilityProbeEnabled: boolean;
   codexUpstreamWebsocketEnabled: boolean;
+  responsesCompactFallbackToResponsesEnabled: boolean;
   disableCrossProtocolFallback: boolean;
   proxySessionChannelConcurrencyLimit: number;
   proxySessionChannelQueueWaitMs: number;
@@ -84,42 +79,6 @@ type SystemProxyTestState =
   | { kind: 'success'; text: string }
   | { kind: 'error'; text: string }
   | null;
-
-type DownstreamApiKeyItem = {
-  id: number;
-  name: string;
-  key: string;
-  keyMasked: string;
-  description: string | null;
-  enabled: boolean;
-  expiresAt: string | null;
-  maxCost: number | null;
-  usedCost: number;
-  maxRequests: number | null;
-  usedRequests: number;
-  supportedModels: string[];
-  allowedRouteIds: number[];
-  lastUsedAt: string | null;
-};
-
-type DownstreamCreateForm = {
-  name: string;
-  key: string;
-  description: string;
-  maxCost: string;
-  maxRequests: string;
-  expiresAt: string;
-  selectedModels: string[];
-  selectedGroupRouteIds: number[];
-};
-
-type RouteSelectorItem = {
-  id: number;
-  modelPattern: string;
-  displayName?: string | null;
-  displayIcon?: string | null;
-  enabled: boolean;
-};
 
 type DatabaseMigrationSummary = {
   dialect: DbDialect;
@@ -228,7 +187,6 @@ function toRouteCooldownSeconds(value: number, unit: RouteCooldownUnit): number 
 }
 
 export default function Settings() {
-  const navigate = useNavigate();
   const isMobile = useIsMobile();
   const [runtime, setRuntime] = useState<RuntimeSettings>({
     checkinCron: '0 8 * * *',
@@ -241,6 +199,7 @@ export default function Settings() {
     logCleanupRetentionDays: 30,
     modelAvailabilityProbeEnabled: false,
     codexUpstreamWebsocketEnabled: false,
+    responsesCompactFallbackToResponsesEnabled: false,
     disableCrossProtocolFallback: false,
     proxySessionChannelConcurrencyLimit: 2,
     proxySessionChannelQueueWaitMs: 1500,
@@ -298,15 +257,6 @@ export default function Settings() {
   const [migrationSummary, setMigrationSummary] = useState<DatabaseMigrationSummary | null>(null);
   const [runtimeDatabaseState, setRuntimeDatabaseState] = useState<RuntimeDatabaseState | null>(null);
   const [showChangeKey, setShowChangeKey] = useState(false);
-  const [downstreamKeys, setDownstreamKeys] = useState<DownstreamApiKeyItem[]>([]);
-  const [downstreamLoading, setDownstreamLoading] = useState(false);
-  const [downstreamSaving, setDownstreamSaving] = useState(false);
-  const [downstreamOps, setDownstreamOps] = useState<Record<number, boolean>>({});
-  const [editingDownstreamId, setEditingDownstreamId] = useState<number | null>(null);
-  const [downstreamModalOpen, setDownstreamModalOpen] = useState(false);
-  const downstreamModalPresence = useAnimatedVisibility(downstreamModalOpen, 220);
-  const [selectorOpen, setSelectorOpen] = useState(false);
-  const selectorModalPresence = useAnimatedVisibility(selectorOpen, 220);
   const [modelAvailabilityProbeConfirmOpen, setModelAvailabilityProbeConfirmOpen] = useState(false);
   const modelAvailabilityProbeConfirmPresence = useAnimatedVisibility(modelAvailabilityProbeConfirmOpen, 220);
   const [modelAvailabilityProbeConfirmationInput, setModelAvailabilityProbeConfirmationInput] = useState('');
@@ -315,55 +265,12 @@ export default function Settings() {
   const factoryResetPresence = useAnimatedVisibility(factoryResetOpen, 220);
   const [factoryResetting, setFactoryResetting] = useState(false);
   const [factoryResetSecondsLeft, setFactoryResetSecondsLeft] = useState(FACTORY_RESET_CONFIRM_SECONDS);
-  const [selectorLoading, setSelectorLoading] = useState(false);
-  const [selectorRoutes, setSelectorRoutes] = useState<RouteSelectorItem[]>([]);
-  const [selectorModelSearch, setSelectorModelSearch] = useState('');
-  const [selectorGroupSearch, setSelectorGroupSearch] = useState('');
-  const [downstreamCreate, setDownstreamCreate] = useState<DownstreamCreateForm>({
-    name: '',
-    key: '',
-    description: '',
-    maxCost: '',
-    maxRequests: '',
-    expiresAt: '',
-    selectedModels: [],
-    selectedGroupRouteIds: [],
-  });
   const toast = useToast();
 
   const activeRoutingProfile = useMemo(
     () => resolveRoutingProfilePreset(runtime.routingWeights),
     [runtime.routingWeights],
   );
-
-  const exactModelOptions = useMemo(() => (
-    selectorRoutes
-      .filter((route) => isExactModelPattern(route.modelPattern))
-      .map((route) => route.modelPattern.trim())
-      .filter((item, index, arr) => item.length > 0 && arr.indexOf(item) === index)
-      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
-  ), [selectorRoutes]);
-
-  const groupRouteOptions = useMemo(() => (
-    selectorRoutes
-      .filter((route) => !isExactModelPattern(route.modelPattern))
-      .sort((a, b) => resolveRouteTitle(a).localeCompare(resolveRouteTitle(b), undefined, { sensitivity: 'base' }))
-  ), [selectorRoutes]);
-
-  const filteredExactModelOptions = useMemo(() => {
-    const query = selectorModelSearch.trim();
-    if (!query) return exactModelOptions;
-    return exactModelOptions.filter((modelName) => fuzzyMatch(modelName, query));
-  }, [exactModelOptions, selectorModelSearch]);
-
-  const filteredGroupRouteOptions = useMemo(() => {
-    const query = selectorGroupSearch.trim();
-    if (!query) return groupRouteOptions;
-    return groupRouteOptions.filter((route) => {
-      const matchText = `${resolveRouteTitle(route)} ${route.modelPattern}`;
-      return fuzzyMatch(matchText, query);
-    });
-  }, [groupRouteOptions, selectorGroupSearch]);
 
   const generatedConnectionString = useMemo(() => (
     buildShorthandConnectionString(migrationDialect, shorthandConnection)
@@ -416,59 +323,154 @@ export default function Settings() {
     background: 'var(--color-bg)',
     color: 'var(--color-text-primary)',
   };
-
-  const toDateTimeLocal = (isoString: string | null | undefined): string => {
-    if (!isoString) return '';
-    const ts = Date.parse(isoString);
-    if (!Number.isFinite(ts)) return '';
-    const date = new Date(ts);
-    const yyyy = date.getFullYear();
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mi = String(date.getMinutes()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+  const settingsModernCardStyle: React.CSSProperties = {
+    padding: isMobile ? 20 : 24,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 16,
+  };
+  const settingsModernDangerCardStyle: React.CSSProperties = {
+    ...settingsModernCardStyle,
+    borderColor: 'color-mix(in srgb, var(--color-danger) 22%, var(--color-border))',
+    background: 'linear-gradient(180deg, color-mix(in srgb, var(--color-danger-soft) 18%, var(--color-bg-card)) 0%, var(--color-bg-card) 100%)',
+  };
+  const settingsModernHeaderStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 12,
+    flexWrap: 'wrap',
+  };
+  const settingsModernTitleBlockStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: 6,
+    minWidth: 0,
+  };
+  const settingsModernTitleStyle: React.CSSProperties = {
+    fontSize: 15,
+    fontWeight: 600,
+    lineHeight: 1.35,
+    color: 'var(--color-text-primary)',
+  };
+  const settingsModernDescriptionStyle: React.CSSProperties = {
+    fontSize: 12,
+    lineHeight: 1.75,
+    color: 'var(--color-text-muted)',
+  };
+  const settingsModernPillRowStyle: React.CSSProperties = {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 8,
+  };
+  const settingsModernCalloutStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: 6,
+    padding: '14px 16px',
+    borderRadius: 'var(--radius-md)',
+    border: '1px solid var(--color-border-light)',
+    background: 'color-mix(in srgb, var(--color-bg) 82%, var(--color-bg-card))',
+  };
+  const settingsModernToggleStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: isMobile ? 12 : 16,
+    padding: '14px 16px',
+    borderRadius: 'var(--radius-md)',
+    border: '1px solid var(--color-border-light)',
+    background: 'color-mix(in srgb, var(--color-bg) 78%, var(--color-bg-card))',
+    cursor: 'pointer',
+  };
+  const settingsModernToggleCopyStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: 6,
+    minWidth: 0,
+  };
+  const settingsModernFieldCardStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: 10,
+    padding: '14px 16px',
+    borderRadius: 'var(--radius-md)',
+    border: '1px solid var(--color-border-light)',
+    background: 'color-mix(in srgb, var(--color-bg) 82%, var(--color-bg-card))',
+  };
+  const settingsModernFieldLabelStyle: React.CSSProperties = {
+    fontSize: 12,
+    fontWeight: 600,
+    color: 'var(--color-text-secondary)',
+  };
+  const settingsModernFieldHintStyle: React.CSSProperties = {
+    fontSize: 12,
+    lineHeight: 1.7,
+    color: 'var(--color-text-muted)',
+    marginTop: -2,
+  };
+  const settingsModernActionsStyle: React.CSSProperties = {
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 10,
   };
 
-  const loadDownstreamKeys = async () => {
-    setDownstreamLoading(true);
-    try {
-      const res = await api.getDownstreamApiKeys();
-      const items = Array.isArray(res?.items) ? res.items : [];
-      setDownstreamKeys(items);
-    } catch (err: any) {
-      toast.error(err?.message || '加载下游 API Key 失败');
-    } finally {
-      setDownstreamLoading(false);
-    }
+  const getSettingsPillStyle = (tone: SettingsPillTone): React.CSSProperties => {
+    const toneStyles: Record<SettingsPillTone, React.CSSProperties> = {
+      neutral: {
+        borderColor: 'color-mix(in srgb, var(--color-text-muted) 12%, var(--color-border-light))',
+        background: 'color-mix(in srgb, var(--color-text-muted) 8%, var(--color-bg-card))',
+        color: 'var(--color-text-secondary)',
+      },
+      primary: {
+        borderColor: 'color-mix(in srgb, var(--color-primary) 20%, var(--color-border-light))',
+        background: 'color-mix(in srgb, var(--color-primary-light) 64%, var(--color-bg-card))',
+        color: 'var(--color-primary)',
+      },
+      warning: {
+        borderColor: 'color-mix(in srgb, var(--color-warning) 20%, var(--color-border-light))',
+        background: 'color-mix(in srgb, var(--color-warning-soft) 68%, var(--color-bg-card))',
+        color: 'var(--color-warning)',
+      },
+      danger: {
+        borderColor: 'color-mix(in srgb, var(--color-danger) 20%, var(--color-border-light))',
+        background: 'color-mix(in srgb, var(--color-danger-soft) 66%, var(--color-bg-card))',
+        color: 'var(--color-danger)',
+      },
+    };
+
+    return {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '5px 10px',
+      borderRadius: 999,
+      border: '1px solid var(--color-border-light)',
+      fontSize: 12,
+      fontWeight: 600,
+      lineHeight: 1.2,
+      whiteSpace: 'nowrap',
+      ...toneStyles[tone],
+    };
   };
 
-  const loadRouteSelectorRoutes = async () => {
-    setSelectorLoading(true);
-    try {
-      const rows = await api.getRoutesLite();
-      setSelectorRoutes((Array.isArray(rows) ? rows : []).map((row: any) => ({
-        id: row.id,
-        modelPattern: row.modelPattern,
-        displayName: row.displayName,
-        displayIcon: row.displayIcon,
-        enabled: !!row.enabled,
-      })));
-    } catch (err: any) {
-      toast.error(err?.message || '加载路由列表失败');
-    } finally {
-      setSelectorLoading(false);
-    }
-  };
+  const proxyTransportModeLabel = runtime.codexUpstreamWebsocketEnabled ? '上游 WebSocket 已启用' : 'HTTP 优先';
+  const proxyTransportQueueLabel = `会话池 ${runtime.proxySessionChannelConcurrencyLimit} 并发 / ${runtime.proxySessionChannelQueueWaitMs}ms`;
+  const modelAvailabilityProbeDirty = runtime.modelAvailabilityProbeEnabled !== savedModelAvailabilityProbeEnabled;
+  const modelAvailabilityProbeStatusTone: SettingsPillTone = modelAvailabilityProbeDirty
+    ? 'warning'
+    : savedModelAvailabilityProbeEnabled
+      ? 'danger'
+      : 'neutral';
+  const modelAvailabilityProbeStatusLabel = modelAvailabilityProbeDirty
+    ? '待保存'
+    : savedModelAvailabilityProbeEnabled
+      ? '已启用'
+      : '已关闭';
 
   const loadSettings = async () => {
     setLoading(true);
     try {
-      const [authInfo, runtimeInfo, downstreamInfo, routeRows, runtimeDatabaseInfo] = await Promise.all([
+      const [authInfo, runtimeInfo, runtimeDatabaseInfo] = await Promise.all([
         api.getAuthInfo(),
         api.getRuntimeSettings(),
-        api.getDownstreamApiKeys(),
-        api.getRoutesLite(),
         api.getRuntimeDatabaseConfig(),
       ]);
       setMaskedToken(authInfo.masked || '****');
@@ -488,6 +490,7 @@ export default function Settings() {
           : 30,
         modelAvailabilityProbeEnabled: !!runtimeInfo.modelAvailabilityProbeEnabled,
         codexUpstreamWebsocketEnabled: !!runtimeInfo.codexUpstreamWebsocketEnabled,
+        responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
         proxySessionChannelConcurrencyLimit: Number(runtimeInfo.proxySessionChannelConcurrencyLimit) >= 0
           ? Math.trunc(Number(runtimeInfo.proxySessionChannelConcurrencyLimit))
@@ -533,14 +536,6 @@ export default function Settings() {
           ? runtimeInfo.adminIpAllowlist.join('\n')
           : '',
       );
-      setDownstreamKeys(Array.isArray(downstreamInfo?.items) ? downstreamInfo.items : []);
-      setSelectorRoutes((Array.isArray(routeRows) ? routeRows : []).map((row: any) => ({
-        id: row.id,
-        modelPattern: row.modelPattern,
-        displayName: row.displayName,
-        displayIcon: row.displayIcon,
-        enabled: !!row.enabled,
-      })));
       if (runtimeDatabaseInfo?.active?.dialect) {
         const preferredDialect = (runtimeDatabaseInfo?.saved?.dialect || runtimeDatabaseInfo.active.dialect) as DbDialect;
         setMigrationDialect(preferredDialect);
@@ -709,6 +704,7 @@ export default function Settings() {
     try {
       const res = await api.updateRuntimeSettings({
         codexUpstreamWebsocketEnabled: runtime.codexUpstreamWebsocketEnabled,
+        responsesCompactFallbackToResponsesEnabled: runtime.responsesCompactFallbackToResponsesEnabled,
         proxySessionChannelConcurrencyLimit: runtime.proxySessionChannelConcurrencyLimit,
         proxySessionChannelQueueWaitMs: runtime.proxySessionChannelQueueWaitMs,
       });
@@ -717,6 +713,9 @@ export default function Settings() {
         codexUpstreamWebsocketEnabled: typeof res?.codexUpstreamWebsocketEnabled === 'boolean'
           ? res.codexUpstreamWebsocketEnabled
           : prev.codexUpstreamWebsocketEnabled,
+        responsesCompactFallbackToResponsesEnabled: typeof res?.responsesCompactFallbackToResponsesEnabled === 'boolean'
+          ? res.responsesCompactFallbackToResponsesEnabled
+          : prev.responsesCompactFallbackToResponsesEnabled,
         proxySessionChannelConcurrencyLimit: Number(res?.proxySessionChannelConcurrencyLimit) >= 0
           ? Math.trunc(Number(res.proxySessionChannelConcurrencyLimit))
           : prev.proxySessionChannelConcurrencyLimit,
@@ -782,163 +781,6 @@ export default function Settings() {
     } finally {
       setSavingProxyFailureRules(false);
     }
-  };
-
-  const resetDownstreamForm = () => {
-    setEditingDownstreamId(null);
-    setDownstreamCreate({
-      name: '',
-      key: '',
-      description: '',
-      maxCost: '',
-      maxRequests: '',
-      expiresAt: '',
-      selectedModels: [],
-      selectedGroupRouteIds: [],
-    });
-  };
-
-  const openCreateDownstreamModal = () => {
-    resetDownstreamForm();
-    setDownstreamModalOpen(true);
-  };
-
-  const closeDownstreamModal = () => {
-    setDownstreamModalOpen(false);
-    resetDownstreamForm();
-  };
-
-  const closeSelectorModal = () => {
-    setSelectorOpen(false);
-    setSelectorModelSearch('');
-    setSelectorGroupSearch('');
-  };
-
-  const beginEditDownstream = (item: DownstreamApiKeyItem) => {
-    setEditingDownstreamId(item.id);
-    setDownstreamCreate({
-      name: item.name || '',
-      key: item.key || '',
-      description: item.description || '',
-      maxCost: item.maxCost === null || item.maxCost === undefined ? '' : String(item.maxCost),
-      maxRequests: item.maxRequests === null || item.maxRequests === undefined ? '' : String(item.maxRequests),
-      expiresAt: toDateTimeLocal(item.expiresAt),
-      selectedModels: Array.isArray(item.supportedModels)
-        ? [...new Set(item.supportedModels.map((model) => String(model).trim()).filter((model) => model.length > 0))]
-        : [],
-      selectedGroupRouteIds: Array.isArray(item.allowedRouteIds)
-        ? [...new Set(item.allowedRouteIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0).map((id) => Math.trunc(id)))]
-        : [],
-    });
-    setDownstreamModalOpen(true);
-  };
-
-  const saveDownstreamKey = async () => {
-    const name = downstreamCreate.name.trim();
-    const rawKey = downstreamCreate.key.trim();
-    if (!name) {
-      toast.info('Please enter a name');
-      return;
-    }
-    if (!rawKey) {
-      toast.info('请填写 API Key');
-      return;
-    }
-    if (!rawKey.startsWith(PROXY_TOKEN_PREFIX)) {
-      toast.info('API Key must start with sk-');
-      return;
-    }
-
-    setDownstreamSaving(true);
-    try {
-      const payload = {
-        name,
-        key: rawKey,
-        description: downstreamCreate.description.trim(),
-        expiresAt: downstreamCreate.expiresAt ? new Date(downstreamCreate.expiresAt).toISOString() : null,
-        maxCost: downstreamCreate.maxCost.trim() ? Number(downstreamCreate.maxCost.trim()) : null,
-        maxRequests: downstreamCreate.maxRequests.trim() ? Number(downstreamCreate.maxRequests.trim()) : null,
-        supportedModels: downstreamCreate.selectedModels,
-        allowedRouteIds: downstreamCreate.selectedGroupRouteIds,
-      };
-
-      if (editingDownstreamId) {
-        await api.updateDownstreamApiKey(editingDownstreamId, payload);
-        toast.success('Downstream API Key updated');
-      } else {
-        await api.createDownstreamApiKey(payload);
-        toast.success('Downstream API Key created');
-      }
-      setDownstreamModalOpen(false);
-      resetDownstreamForm();
-      await loadDownstreamKeys();
-    } catch (err: any) {
-      toast.error(err?.message || '保存下游 API Key 失败');
-    } finally {
-      setDownstreamSaving(false);
-    }
-  };
-
-  const toggleModelSelection = (modelName: string) => {
-    setDownstreamCreate((prev) => {
-      const exists = prev.selectedModels.includes(modelName);
-      return {
-        ...prev,
-        selectedModels: exists
-          ? prev.selectedModels.filter((item) => item !== modelName)
-          : [...prev.selectedModels, modelName],
-      };
-    });
-  };
-
-  const toggleGroupRouteSelection = (routeId: number) => {
-    setDownstreamCreate((prev) => {
-      const exists = prev.selectedGroupRouteIds.includes(routeId);
-      return {
-        ...prev,
-        selectedGroupRouteIds: exists
-          ? prev.selectedGroupRouteIds.filter((item) => item !== routeId)
-          : [...prev.selectedGroupRouteIds, routeId],
-      };
-    });
-  };
-
-  const runDownstreamOp = async (id: number, action: () => Promise<void>) => {
-    setDownstreamOps((prev) => ({ ...prev, [id]: true }));
-    try {
-      await action();
-    } finally {
-      setDownstreamOps((prev) => ({ ...prev, [id]: false }));
-    }
-  };
-
-  const toggleDownstreamEnabled = async (item: DownstreamApiKeyItem) => {
-    await runDownstreamOp(item.id, async () => {
-      await api.updateDownstreamApiKey(item.id, { enabled: !item.enabled });
-      await loadDownstreamKeys();
-      toast.success(item.enabled ? 'Disabled' : 'Enabled');
-    });
-  };
-
-  const resetDownstreamUsage = async (item: DownstreamApiKeyItem) => {
-    await runDownstreamOp(item.id, async () => {
-      await api.resetDownstreamApiKeyUsage(item.id);
-      await loadDownstreamKeys();
-      toast.success('Usage reset');
-    });
-  };
-
-  const deleteDownstreamKey = async (item: DownstreamApiKeyItem) => {
-    if (!window.confirm('Confirm delete API Key?')) return;
-    await runDownstreamOp(item.id, async () => {
-      await api.deleteDownstreamApiKey(item.id);
-      if (editingDownstreamId === item.id) {
-        setDownstreamModalOpen(false);
-        resetDownstreamForm();
-      }
-      await loadDownstreamKeys();
-      toast.success('Deleted');
-    });
   };
 
   const saveRouting = async () => {
@@ -1422,26 +1264,54 @@ export default function Settings() {
           </div>
         </div>
 
-        <div className="card animate-slide-up stagger-4" style={{ padding: 20 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>Codex 上游传输与会话并发</div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
-            默认采用 HTTP 优先。只有这里开启后，metapi 才会在 Codex 请求上尝试把上游升级为 WebSocket。
-            下游 Codex 客户端也必须同时启用 `/v1/responses` websocket，单开这里不会生效。
+        <div className="card animate-slide-up stagger-4" style={settingsModernCardStyle} data-settings-card="proxy-transport">
+          <div style={settingsModernHeaderStyle}>
+            <div style={settingsModernTitleBlockStyle}>
+              <div style={settingsModernTitleStyle}>Codex 上游传输与会话并发</div>
+              <div style={settingsModernDescriptionStyle}>
+                默认采用 HTTP 优先。只有这里开启后，metapi 才会在 Codex 请求上尝试把上游升级为 WebSocket。下游 Codex 客户端也必须同时启用 `/v1/responses` websocket，单开这里不会生效。
+              </div>
+            </div>
+            <div style={settingsModernPillRowStyle}>
+              <span style={getSettingsPillStyle(runtime.codexUpstreamWebsocketEnabled ? 'primary' : 'neutral')}>
+                {proxyTransportModeLabel}
+              </span>
+              <span style={getSettingsPillStyle('neutral')}>
+                {proxyTransportQueueLabel}
+              </span>
+            </div>
           </div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
-            从旧版本升级时，原先账号 `extraConfig.websockets` 的行为不再单独生效；现在统一以这里的全局设置和下游客户端是否开启为准。
-          </div>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 14 }}>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>允许 metapi 到 Codex 上游使用 WebSocket</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                仅在下游 Codex 客户端已同步开启 `/v1/responses` websocket 时启用；否则仍按 HTTP 优先执行。
+              </span>
+            </div>
             <input
               type="checkbox"
               checked={runtime.codexUpstreamWebsocketEnabled}
               onChange={(e) => setRuntime((prev) => ({ ...prev, codexUpstreamWebsocketEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
-            允许 metapi 到 Codex 上游使用 WebSocket
           </label>
-          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 10 }}>
-            <div>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>会话通道并发上限</div>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>Compact 明确不支持时回退到普通 Responses</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                仅对 `/v1/responses/compact` 生效。当上游明确返回 compact 不支持时，允许自动回退到普通 `/responses`。
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={runtime.responsesCompactFallbackToResponsesEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, responsesCompactFallbackToResponsesEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
+            />
+          </label>
+          <ResponsiveFormGrid columns={2}>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>会话通道并发上限</div>
               <input
                 type="number"
                 min={0}
@@ -1457,9 +1327,12 @@ export default function Settings() {
                 }}
                 style={inputStyle}
               />
+              <div style={settingsModernFieldHintStyle}>
+                只作用于能识别稳定 `session_id` 的会话型请求；普通请求不会进入这组 lease 池。
+              </div>
             </div>
-            <div>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>排队等待时间（毫秒）</div>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>排队等待时间（毫秒）</div>
               <input
                 type="number"
                 min={0}
@@ -1476,38 +1349,83 @@ export default function Settings() {
                 }}
                 style={inputStyle}
               />
+              <div style={settingsModernFieldHintStyle}>
+                超过该时间仍拿不到会话通道时，本次请求会直接放弃排队，避免长期挂起。
+              </div>
             </div>
-          </div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
-            这组 lease 只作用于能识别稳定 `session_id` 的会话型请求；没有稳定会话标识的普通请求不会进入这个池。
-          </div>
-          <div>
+          </ResponsiveFormGrid>
+          <div style={settingsModernActionsStyle}>
             <button onClick={saveProxyTransportSettings} disabled={savingProxyTransport} className="btn btn-primary">
               {savingProxyTransport ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存传输与并发'}
             </button>
           </div>
         </div>
 
-        <div className="card animate-slide-up stagger-4" style={{ padding: 20, border: '1px solid color-mix(in srgb, var(--color-danger) 24%, var(--color-border))' }}>
-          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8, color: 'var(--color-danger)' }}>批量测活</div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.8 }}>
-            默认关闭。开启后，metapi 会在后台定时对活跃账号模型发送最小化探测请求，用来校正“/models 能看到但实际不可用”的假阳性。
+        <div className="card animate-slide-up stagger-4" style={settingsModernDangerCardStyle} data-settings-card="model-availability-probe">
+          <div style={settingsModernHeaderStyle}>
+            <div style={settingsModernTitleBlockStyle}>
+              <div style={{ ...settingsModernTitleStyle, color: 'var(--color-danger)' }}>批量测活</div>
+              <div style={settingsModernDescriptionStyle}>
+                默认关闭。开启后，metapi 会在后台定时对活跃账号模型发送最小化探测请求，用来校正“/models 能看到但实际不可用”的假阳性。
+              </div>
+            </div>
+            <div style={settingsModernPillRowStyle}>
+              <span style={getSettingsPillStyle(modelAvailabilityProbeStatusTone)}>
+                {modelAvailabilityProbeStatusLabel}
+              </span>
+              <span style={getSettingsPillStyle('danger')}>
+                高风险操作
+              </span>
+            </div>
           </div>
-          <div style={{ padding: 12, borderRadius: 'var(--radius-sm)', background: 'var(--color-danger-bg)', color: 'var(--color-danger)', fontSize: 12, lineHeight: 1.8, marginBottom: 12 }}>
-            只有在你确认自己使用的中转站明确允许批量测活时才应该开启。若上游不允许，这类探测可能带来封号或风控风险。
+          <div
+            style={{
+              ...settingsModernCalloutStyle,
+              borderColor: 'color-mix(in srgb, var(--color-danger) 18%, var(--color-border-light))',
+              background: 'color-mix(in srgb, var(--color-danger-soft) 38%, var(--color-bg-card))',
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-danger)' }}>风险提示</div>
+            <div style={{ fontSize: 12, lineHeight: 1.75, color: 'var(--color-text-secondary)' }}>
+              只有在你确认自己使用的中转站明确允许批量测活时才应该开启。若上游不允许，这类探测可能带来封号或风控风险。
+            </div>
           </div>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 12 }}>
+          <label style={settingsModernToggleStyle}>
+            <div style={settingsModernToggleCopyStyle}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>允许 metapi 后台主动批量测活</span>
+              <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
+                首次从关闭切换到开启时，需要手动输入确认语句；关闭时可直接保存。
+              </span>
+            </div>
             <input
               type="checkbox"
               checked={runtime.modelAvailabilityProbeEnabled}
               onChange={(e) => setRuntime((prev) => ({ ...prev, modelAvailabilityProbeEnabled: e.target.checked }))}
+              style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
-            允许 metapi 后台主动批量测活
           </label>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginBottom: 12 }}>
-            当前状态：{savedModelAvailabilityProbeEnabled ? '已启用' : '已关闭'}。首次开启必须手动输入确认语句。
-          </div>
-          <div>
+          <ResponsiveFormGrid columns={2}>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>当前生效状态</div>
+              <div style={settingsModernPillRowStyle}>
+                <span style={getSettingsPillStyle(modelAvailabilityProbeStatusTone)}>
+                  {modelAvailabilityProbeStatusLabel}
+                </span>
+              </div>
+              <div style={settingsModernFieldHintStyle}>
+                {savedModelAvailabilityProbeEnabled
+                  ? '后台会定时执行最小化探测请求，用于校正模型可用性。'
+                  : '后台不会主动发起模型可用性探测请求。'}
+              </div>
+            </div>
+            <div style={settingsModernFieldCardStyle}>
+              <div style={settingsModernFieldLabelStyle}>启用门槛</div>
+              <div style={{ ...settingsModernFieldHintStyle, marginTop: 0 }}>
+                首次开启必须手动输入确认语句，避免误把高风险探测当成普通开关。
+              </div>
+            </div>
+          </ResponsiveFormGrid>
+          <div style={settingsModernActionsStyle}>
             <button onClick={saveModelAvailabilityProbeSettings} disabled={savingModelAvailabilityProbe} className="btn btn-primary">
               {savingModelAvailabilityProbe ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存批量测活设置'}
             </button>
@@ -1605,18 +1523,6 @@ export default function Settings() {
           <button onClick={saveProxyToken} disabled={savingToken} className="btn btn-primary">
             {savingToken ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '更新下游访问令牌'}
           </button>
-        </div>
-
-        <div className="card animate-slide-up stagger-5" style={{ padding: 20 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>下游密钥管理入口已迁移</div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.8 }}>
-            下游 API Key 的新增、编辑、模型白名单、群组限制、趋势与用量分析，现统一收口到「控制台 / 下游密钥」页面，设置页不再保留重复管理入口。
-          </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button onClick={() => navigate('/downstream-keys')} className="btn btn-primary">
-              打开下游密钥管理页
-            </button>
-          </div>
         </div>
 
         <div className="card animate-slide-up stagger-5" style={{ padding: 20 }}>
@@ -2207,22 +2113,6 @@ export default function Settings() {
           </div>
         </div>
       </div>
-      <DownstreamApiKeyModal
-        presence={downstreamModalPresence}
-        editingDownstreamId={editingDownstreamId}
-        downstreamCreate={downstreamCreate}
-        downstreamSaving={downstreamSaving}
-        inputStyle={inputStyle}
-        onChange={(updater) => setDownstreamCreate((prev) => updater(prev))}
-        onOpenSelector={async () => {
-          if (selectorRoutes.length === 0) await loadRouteSelectorRoutes();
-          setSelectorModelSearch('');
-          setSelectorGroupSearch('');
-          setSelectorOpen(true);
-        }}
-        onClose={closeDownstreamModal}
-        onSave={saveDownstreamKey}
-      />
       <FactoryResetModal
         presence={factoryResetPresence}
         factoryResetting={factoryResetting}
@@ -2239,26 +2129,6 @@ export default function Settings() {
         onConfirmationInputChange={setModelAvailabilityProbeConfirmationInput}
         onClose={closeModelAvailabilityProbeConfirmModal}
         onConfirm={handleConfirmModelAvailabilityProbe}
-      />
-      <RouteSelectorModal
-        presence={selectorModalPresence}
-        loading={selectorLoading}
-        exactModelOptions={exactModelOptions}
-        filteredExactModelOptions={filteredExactModelOptions}
-        groupRouteOptions={groupRouteOptions}
-        filteredGroupRouteOptions={filteredGroupRouteOptions}
-        selectorModelSearch={selectorModelSearch}
-        selectorGroupSearch={selectorGroupSearch}
-        onSelectorModelSearchChange={setSelectorModelSearch}
-        onSelectorGroupSearchChange={setSelectorGroupSearch}
-        selection={{
-          selectedModels: downstreamCreate.selectedModels,
-          selectedGroupRouteIds: downstreamCreate.selectedGroupRouteIds,
-        }}
-        onToggleModelSelection={toggleModelSelection}
-        onToggleGroupRouteSelection={toggleGroupRouteSelection}
-        onClose={closeSelectorModal}
-        inputStyle={inputStyle}
       />
     </div>
   );

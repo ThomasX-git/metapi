@@ -134,12 +134,12 @@ async function fetchAuthenticatedResponse(url: string, options: RequestOptions =
   }
 }
 
-async function request(url: string, options: RequestOptions = {}) {
+async function request<T = any>(url: string, options: RequestOptions = {}): Promise<T> {
   const res = await fetchAuthenticatedResponse(url, options);
   if (!res.ok) {
     throw new Error(await extractResponseErrorMessage(res));
   }
-  return res.json();
+  return res.json() as Promise<T>;
 }
 
 async function streamSse(
@@ -344,6 +344,7 @@ export type RuntimeSettingsPayload = {
   systemProxyUrl?: string;
   modelAvailabilityProbeEnabled?: boolean;
   codexUpstreamWebsocketEnabled?: boolean;
+  responsesCompactFallbackToResponsesEnabled?: boolean;
   disableCrossProtocolFallback?: boolean;
   proxySessionChannelConcurrencyLimit?: number;
   proxySessionChannelQueueWaitMs?: number;
@@ -580,6 +581,31 @@ export type OAuthProviderInfo = {
   supportsNativeProxy: boolean;
 };
 
+export type OAuthProvidersResponse = {
+  providers: OAuthProviderInfo[];
+  defaults?: {
+    systemProxyConfigured?: boolean;
+  };
+};
+
+export type OAuthRouteUnitStrategy = 'round_robin' | 'stick_until_unavailable';
+
+export type OAuthRouteUnitSummary = {
+  id?: number;
+  routeUnitId?: number;
+  name: string;
+  strategy: OAuthRouteUnitStrategy;
+  memberCount: number;
+};
+
+export type OAuthRouteParticipation =
+  | {
+    kind: 'single';
+  }
+  | ({
+    kind: 'route_unit';
+  } & OAuthRouteUnitSummary);
+
 export type OAuthStartInstructions = {
   redirectUri: string;
   callbackPort: number;
@@ -649,6 +675,9 @@ export type OAuthConnectionInfo = {
   lastModelSyncAt?: string | null;
   lastModelSyncError?: string | null;
   proxyUrl?: string | null;
+  useSystemProxy?: boolean;
+  routeUnit?: OAuthRouteUnitSummary | null;
+  routeParticipation?: OAuthRouteParticipation | null;
   site?: { id: number; name: string; url: string; platform: string } | null;
 };
 
@@ -657,6 +686,59 @@ export type OAuthConnectionsResponse = {
   total: number;
   limit: number;
   offset: number;
+};
+
+export type OAuthQuotaBatchRefreshResponse = {
+  success: boolean;
+  refreshed: number;
+  failed: number;
+  items: Array<{
+    accountId: number;
+    success: boolean;
+    quota?: OAuthQuotaInfo;
+    error?: string;
+  }>;
+};
+
+export type OAuthImportResponse = {
+  success: boolean;
+  imported: number;
+  skipped: number;
+  failed: number;
+  items: Array<{
+    name: string;
+    status: 'imported' | 'skipped' | 'failed';
+    accountId?: number;
+    provider?: string;
+    message?: string;
+  }>;
+};
+
+export type OAuthRouteUnitMutationResponse = {
+  success: boolean;
+  routeUnit?: OAuthRouteUnitSummary;
+};
+
+export type DownstreamApiKeyTrendBucket = {
+  startUtc: string | null;
+  totalRequests: number;
+  successRequests: number;
+  failedRequests: number;
+  successRate: number | null;
+  totalTokens: number;
+  totalCost: number;
+};
+
+export type DownstreamApiKeyTrendResponse = {
+  success: boolean;
+  range: '24h' | '7d' | 'all';
+  item: {
+    id: number;
+    name: string;
+  };
+  bucketSeconds: number;
+  timeZone?: string | null;
+  buckets: DownstreamApiKeyTrendBucket[];
 };
 
 export const api = {
@@ -672,7 +754,7 @@ export const api = {
   getSiteAvailableModels: (siteId: number) => request(`/api/sites/${siteId}/available-models`),
 
   // Accounts
-  getAccounts: () => request('/api/accounts'),
+  getAccounts: (params?: { includeOauth?: boolean }) => request(`/api/accounts${buildQueryString(params)}`),
   addAccount: (data: any) => request('/api/accounts', { method: 'POST', body: JSON.stringify(data) }),
   loginAccount: (data: { siteId: number; username: string; password: string }) => request('/api/accounts/login', { method: 'POST', body: JSON.stringify(data) }),
   verifyToken: (data: { siteId: number; accessToken: string; platformUserId?: number; credentialMode?: 'auto' | 'session' | 'apikey' }) => request('/api/accounts/verify-token', { method: 'POST', body: JSON.stringify(data) }),
@@ -781,8 +863,8 @@ export const api = {
   search: (query: string) => request('/api/search', { method: 'POST', body: JSON.stringify({ query, limit: 20 }) }),
 
   // OAuth
-  getOAuthProviders: () => request('/api/oauth/providers') as Promise<{ providers: OAuthProviderInfo[] }>,
-  startOAuthProvider: (provider: string, data?: { accountId?: number; projectId?: string; proxyUrl?: string | null }) => request(`/api/oauth/providers/${encodeURIComponent(provider)}/start`, {
+  getOAuthProviders: () => request('/api/oauth/providers') as Promise<OAuthProvidersResponse>,
+  startOAuthProvider: (provider: string, data?: { accountId?: number; projectId?: string; proxyUrl?: string | null; useSystemProxy?: boolean }) => request(`/api/oauth/providers/${encodeURIComponent(provider)}/start`, {
     method: 'POST',
     body: JSON.stringify(data || {}),
   }) as Promise<OAuthStartResponse>,
@@ -797,11 +879,30 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({}),
   }) as Promise<{ success: true; quota: OAuthQuotaInfo }>,
-  rebindOAuthConnection: (accountId: number, data?: { proxyUrl?: string | null }) => request(`/api/oauth/connections/${accountId}/rebind`, {
+  refreshOAuthConnectionQuotaBatch: (accountIds: number[]) => request('/api/oauth/connections/quota/refresh-batch', {
+    method: 'POST',
+    body: JSON.stringify({ accountIds }),
+  }) as Promise<OAuthQuotaBatchRefreshResponse>,
+  updateOAuthConnectionProxy: (accountId: number, data: { proxyUrl?: string | null; useSystemProxy?: boolean }) => request(`/api/oauth/connections/${accountId}/proxy`, {
+    method: 'PATCH',
+    body: JSON.stringify(data || {}),
+  }) as Promise<{ success: true }>,
+  rebindOAuthConnection: (accountId: number, data?: { proxyUrl?: string | null; useSystemProxy?: boolean }) => request(`/api/oauth/connections/${accountId}/rebind`, {
     method: 'POST',
     body: JSON.stringify(data || {}),
   }) as Promise<OAuthStartResponse>,
   deleteOAuthConnection: (accountId: number) => request(`/api/oauth/connections/${accountId}`, {
+    method: 'DELETE',
+  }) as Promise<{ success: true }>,
+  importOAuthConnections: (data: Record<string, unknown>) => request('/api/oauth/import', {
+    method: 'POST',
+    body: JSON.stringify(Array.isArray(data.items) ? data : { data }),
+  }) as Promise<OAuthImportResponse>,
+  createOAuthRouteUnit: (data: { accountIds: number[]; name: string; strategy: OAuthRouteUnitStrategy }) => request('/api/oauth/route-units', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }) as Promise<OAuthRouteUnitMutationResponse>,
+  deleteOAuthRouteUnit: (routeUnitId: number) => request(`/api/oauth/route-units/${routeUnitId}`, {
     method: 'DELETE',
   }) as Promise<{ success: true }>,
 
@@ -914,8 +1015,8 @@ export const api = {
   getDownstreamApiKeysSummary: (params?: { range?: '24h' | '7d' | 'all'; status?: 'all' | 'enabled' | 'disabled'; search?: string }) =>
     request(`/api/downstream-keys/summary${buildQueryString(params)}`),
   getDownstreamApiKeyOverview: (id: number) => request(`/api/downstream-keys/${id}/overview`),
-  getDownstreamApiKeyTrend: (id: number, params?: { range?: '24h' | '7d' | 'all' }) =>
-    request(`/api/downstream-keys/${id}/trend${buildQueryString(params)}`),
+  getDownstreamApiKeyTrend: (id: number, params?: { range?: '24h' | '7d' | 'all'; timeZone?: string }) =>
+    request<DownstreamApiKeyTrendResponse>(`/api/downstream-keys/${id}/trend${buildQueryString(params)}`),
   exportBackup: (type: 'all' | 'accounts' | 'preferences' = 'all') =>
     request(`/api/settings/backup/export?type=${encodeURIComponent(type)}`),
   importBackup: (data: any) =>
